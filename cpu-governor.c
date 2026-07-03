@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <glob.h>
 #include <sys/stat.h>
-#include <errno.h>
 
 #define MAX_PATH 256
 #define MAX_BUFFER 1024
@@ -175,12 +174,12 @@ void show_current_status() {
 int validate_governor(const char* governor) {
     char available[MAX_BUFFER];
     
-    if (!read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors", 
+    // Quiet on failure (e.g. a VM with no cpufreq): callers report their own errors.
+    if (!read_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors",
                    available, sizeof(available))) {
-        print_colored(RED, "ERROR", "Cannot read available governors");
         return 0;
     }
-    
+
     return strstr(available, governor) != NULL;
 }
 
@@ -300,13 +299,61 @@ void restore_kernel_defaults() {
     }
 }
 
+// Set a tunable only if the knob exists (silent when absent, so it is portable
+// across kernels and hardware).
+void set_tunable(const char* path, const char* value) {
+    if (file_exists(path)) write_file(path, value);
+}
+
+// Govern kernel-level knobs per profile. This is the ArxOS governance layer: the
+// CPU governor and the kernel tunables move together. Curated, safe knobs only.
+// After the built-ins, it applies any linux-arxos kernel/patch profile dropped in
+// /etc/arxos/kernel.d/<profile>.conf (this is where custom-kernel optimizations and
+// patch tunables will plug in as they land).
+void apply_kernel_tunables(const char* profile) {
+    if (strcmp(profile, "performance") == 0) {
+        set_tunable("/proc/sys/vm/swappiness", "10");
+        set_tunable("/proc/sys/kernel/nmi_watchdog", "0");
+        set_tunable("/proc/sys/vm/dirty_ratio", "10");
+        set_tunable("/sys/kernel/mm/transparent_hugepage/enabled", "always");
+    } else if (strcmp(profile, "powersave") == 0) {
+        set_tunable("/proc/sys/vm/swappiness", "100");
+        set_tunable("/proc/sys/kernel/nmi_watchdog", "0");
+        set_tunable("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
+    } else { /* balanced (ArxOS default) */
+        set_tunable("/proc/sys/vm/swappiness", "60");
+        set_tunable("/proc/sys/kernel/nmi_watchdog", "0");
+        set_tunable("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
+    }
+    // forward-looking hook: apply the linux-arxos patch/optimization profile if present
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+        "test -f /etc/arxos/kernel.d/%s.conf && sysctl -qp /etc/arxos/kernel.d/%s.conf 2>/dev/null",
+        profile, profile);
+    system(cmd);
+    printf("%s[INFO]%s kernel tunables applied (%s profile)\n", BLUE, RESET, profile);
+}
+
 void performance_mode() {
     printf("%s=== MAXIMUM PERFORMANCE MODE ===%s\n", MAGENTA, RESET);
     set_governor("performance");
     set_cpu_boost(1);
     set_energy_preference("performance");
     apply_kernel_optimizations();
+    apply_kernel_tunables("performance");
     printf("%s[SUCCESS]%s System configured for maximum performance\n", GREEN, RESET);
+}
+
+void balanced_mode() {
+    printf("%s=== BALANCED MODE (ArxOS default) ===%s\n", MAGENTA, RESET);
+    if (validate_governor("schedutil")) set_governor("schedutil");
+    else if (validate_governor("ondemand")) set_governor("ondemand");
+    else if (validate_governor("conservative")) set_governor("conservative");
+    set_cpu_boost(1);
+    set_energy_preference("balance_performance");
+    restore_kernel_defaults();
+    apply_kernel_tunables("balanced");
+    printf("%s[SUCCESS]%s System configured for balanced performance and efficiency\n", GREEN, RESET);
 }
 
 void powersave_mode() {
@@ -315,6 +362,7 @@ void powersave_mode() {
     set_cpu_boost(0);
     set_energy_preference("power");
     restore_kernel_defaults();
+    apply_kernel_tunables("powersave");
     printf("%s[SUCCESS]%s System configured for power saving\n", GREEN, RESET);
 }
 
@@ -389,6 +437,7 @@ void show_usage() {
     
     printf("%sCommands:%s\n", YELLOW, RESET);
     printf("  %-15s - Maximum performance mode (recommended)\n", "performance");
+    printf("  %-15s - Balanced schedutil mode (ArxOS default)\n", "balanced");
     printf("  %-15s - Power saving mode\n", "powersave");
     printf("  %-15s - Show current CPU status\n", "status");
     printf("  %-15s - Install system-wide (requires sudo)\n", "install");
@@ -446,6 +495,8 @@ int main(int argc, char* argv[]) {
     
     if (strcmp(command, "performance") == 0) {
         performance_mode();
+    } else if (strcmp(command, "balanced") == 0 || strcmp(command, "default") == 0) {
+        balanced_mode();
     } else if (strcmp(command, "powersave") == 0) {
         powersave_mode();
     } else {
